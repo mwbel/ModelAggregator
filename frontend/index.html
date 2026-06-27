@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Model Aggregator Service</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">MODEL AGGREGATOR SERVICE</p>
+          <h1>模型聚合服务</h1>
+          <p class="subtitle">统一调用本地模型、Gemini、云雾 GPT-5.5 和 Mathpix，供多个项目通过 API 访问。</p>
+        </div>
+        <div id="serviceStatus" class="status-pill">Checking</div>
+      </header>
+
+      <section class="grid">
+        <aside class="panel">
+          <div class="panel-header">
+            <h2>可用模型</h2>
+            <button id="refreshModels" type="button">刷新</button>
+          </div>
+          <p id="modelSummary" class="muted">等待加载...</p>
+          <div id="modelList" class="model-list"></div>
+        </aside>
+
+        <section class="panel workspace">
+          <div class="panel-header">
+            <h2>快速测试</h2>
+            <button id="compareButton" type="button">多模型对比</button>
+          </div>
+          <label class="field">
+            <span>模型</span>
+            <select id="modelSelect"></select>
+          </label>
+          <label class="field">
+            <span>问题</span>
+            <textarea id="promptInput" rows="5">只回复 OK</textarea>
+          </label>
+          <div class="actions">
+            <button id="sendButton" type="button" class="primary">发送</button>
+            <button id="clearButton" type="button">清空结果</button>
+          </div>
+          <pre id="resultBox" class="result-box">{}</pre>
+        </section>
+      </section>
+
+      <section class="panel api-panel">
+        <h2>API 入口</h2>
+        <div class="endpoint-grid">
+          <code>GET /api/aggregate/health</code>
+          <code>GET /api/aggregate/config</code>
+          <code>POST /api/aggregate/models</code>
+          <code>POST /api/aggregate/chat</code>
+          <code>POST /api/aggregate/compare</code>
+          <code>POST /api/aggregate/image-to-markdown</code>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
