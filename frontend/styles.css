@@ -94,6 +94,30 @@ h2 {
   color: var(--muted);
 }
 
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.launch-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--blue);
+  border-radius: 8px;
+  color: var(--blue);
+  background: #eff6ff;
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.launch-link:hover {
+  background: #dbeafe;
+}
+
 .status-pill {
   min-width: 104px;
   text-align: center;

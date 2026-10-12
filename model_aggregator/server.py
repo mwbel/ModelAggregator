@@ -17,6 +17,7 @@ from model_aggregator.services.model_aggregator import MODEL_TESTER_SERVICE
 AGGREGATOR_HOST = os.getenv("AGGREGATOR_HOST", os.getenv("APP_HOST", "127.0.0.1"))
 AGGREGATOR_PORT = int(os.getenv("AGGREGATOR_PORT", os.getenv("APP_PORT", "8890")))
 SERVICE_NAME = os.getenv("AGGREGATOR_SERVICE_NAME", "Model Aggregator Service")
+SERVICE_VERSION = "0.2.0"
 API_PREFIX = "/api/aggregate"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = ROOT_DIR / "frontend"
@@ -47,7 +48,14 @@ def _compare(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": "请提供 models 或 model。", "results": []}
 
     task_type = str(payload.get("taskType") or payload.get("mode") or "chat").strip().lower()
-    is_image_markdown = task_type in {"image-to-markdown", "ocr", "image_markdown", "image-to-md"}
+    is_image_markdown = task_type in {
+        "image-to-markdown",
+        "ocr",
+        "image_markdown",
+        "image-to-md",
+        "ocr.zh",
+        "ocr.bo",
+    }
     results: list[dict[str, Any]] = []
     started_at = time.perf_counter()
 
@@ -74,14 +82,14 @@ def _compare(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "ok": any(item.get("ok") for item in results),
-        "taskType": "image-to-markdown" if is_image_markdown else "chat",
+        "taskType": task_type if task_type in {"ocr.zh", "ocr.bo"} else ("image-to-markdown" if is_image_markdown else "chat"),
         "latencyMs": round((time.perf_counter() - started_at) * 1000),
         "results": results,
     }
 
 
 class AggregatorHandler(BaseHTTPRequestHandler):
-    server_version = "ModelAggregatorHTTP/0.1"
+    server_version = f"ModelAggregatorHTTP/{SERVICE_VERSION}"
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -104,6 +112,7 @@ class AggregatorHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": SERVICE_NAME,
+                    "version": SERVICE_VERSION,
                     "apiPrefix": API_PREFIX,
                     "appName": SETTINGS.app_name,
                 }
@@ -114,12 +123,15 @@ class AggregatorHandler(BaseHTTPRequestHandler):
                 {
                     **MODEL_TESTER_SERVICE.config(),
                     "service": SERVICE_NAME,
+                    "version": SERVICE_VERSION,
                     "apiPrefix": API_PREFIX,
                     "endpoints": {
                         "health": f"{API_PREFIX}/health",
                         "config": f"{API_PREFIX}/config",
                         "models": f"{API_PREFIX}/models",
                         "upload": f"{API_PREFIX}/upload",
+                        "route": f"{API_PREFIX}/route",
+                        "benchmark": f"{API_PREFIX}/benchmark",
                         "chat": f"{API_PREFIX}/chat",
                         "imageToMarkdown": f"{API_PREFIX}/image-to-markdown",
                         "compare": f"{API_PREFIX}/compare",
@@ -138,6 +150,12 @@ class AggregatorHandler(BaseHTTPRequestHandler):
             return
         if parsed.path in {f"{API_PREFIX}/upload", f"{API_PREFIX}/attachments"}:
             self._send_json(MODEL_TESTER_SERVICE.upload_attachment(payload))
+            return
+        if parsed.path == f"{API_PREFIX}/route":
+            self._send_json(MODEL_TESTER_SERVICE.route(payload))
+            return
+        if parsed.path == f"{API_PREFIX}/benchmark":
+            self._send_json(MODEL_TESTER_SERVICE.benchmark(payload))
             return
         if parsed.path == f"{API_PREFIX}/chat":
             self._send_json(MODEL_TESTER_SERVICE.chat(payload))

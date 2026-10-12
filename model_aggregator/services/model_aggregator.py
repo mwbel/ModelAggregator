@@ -11,6 +11,34 @@ from urllib.parse import quote
 import requests
 
 from model_aggregator.config import SETTINGS
+from model_aggregator.services.benchmark import (
+    BENCHMARK_TASKS,
+    MAX_BENCHMARK_CASES,
+    MAX_BENCHMARK_MODELS,
+    MAX_BENCHMARK_RUNS,
+    build_chat_payload,
+    build_image_payload,
+    case_attachment_ids,
+    case_reference,
+    case_source_text,
+    normalize_benchmark_cases,
+    public_task_catalog,
+    score_against_reference,
+    summarize_task_rows,
+)
+from model_aggregator.services.model_registry import (
+    SUPPORTED_TASK_TYPES,
+    ModelProfile,
+    build_model_profiles,
+    find_model_profile,
+    translation_zh_en_guide,
+)
+from model_aggregator.services.task_router import (
+    RouteDecision,
+    is_auto_model_ref,
+    normalize_task_type,
+    select_model_for_payload,
+)
 
 
 def _compact_error(response: requests.Response) -> str:
@@ -71,6 +99,10 @@ def _parse_gemini_models(payload: Any) -> list[str]:
         model_id = name.removeprefix("models/").strip()
         if model_id:
             items.append(model_id)
+    items = [model for model in items if model != "gemini-2.5-flash"]
+    for model in ("gemini-3.6-flash", "gemini-3.8-flash"):
+        if model not in items:
+            items.append(model)
     return list(dict.fromkeys(items))
 
 
@@ -161,9 +193,9 @@ def _is_ocr_candidate_model(model: str, allow_possible: bool = False) -> bool:
 def _image_markdown_timeout(provider: str) -> float:
     configured = max(1.0, SETTINGS.ocr_correction_timeout_seconds)
     if provider == "gemini":
-        return min(configured, 45)
+        return max(1.0, SETTINGS.image_markdown_gemini_timeout_seconds)
     if provider == "yunwu-gpt55":
-        return min(configured, 60)
+        return max(1.0, SETTINGS.image_markdown_yunwu_timeout_seconds)
     if provider == "mathpix":
         return min(max(1.0, SETTINGS.mathpix_timeout_seconds), 90)
     return configured
@@ -176,8 +208,8 @@ def _image_markdown_max_tokens(payload: dict[str, Any]) -> int:
     return max(8192, SETTINGS.ocr_correction_max_output_tokens)
 
 
-def _gemini_image_key_attempt_order() -> list[str]:
-    return _gemini_key_attempt_order()[:2]
+def _gemini_image_key_attempt_order() -> list[tuple[int, str]]:
+    return _gemini_key_attempt_order(limit=2)
 
 
 def _extract_endpoint_config(base_url: str, models_path: str, chat_path: str) -> tuple[str, str, str]:
@@ -200,6 +232,23 @@ def _headers(api_key: str) -> dict[str, str]:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
+
+
+OLLAMA_NATIVE_CHAT_MODELS = {
+    "qwen3.6-27b:latest",
+    "batiai/qwen3.6-27b:q4",
+}
+
+
+def _should_use_ollama_native_chat(provider: str, model: str) -> bool:
+    return provider == "openai-compatible" and model.strip().lower() in OLLAMA_NATIVE_CHAT_MODELS
+
+
+def _ollama_native_base_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1"):
+        return normalized[: -len("/v1")]
+    return normalized
 
 
 def _parse_data_url(data_url: str) -> tuple[str, str] | None:
@@ -689,9 +738,81 @@ def _resolve_openai_provider_config(payload: dict[str, Any], provider: str) -> t
 
 
 GEMINI_KEY_CURSOR = 0
+GEMINI_KEY_COOLDOWNS: dict[str, float] = {}
+GEMINI_RETRYABLE_STATUS_CODES = {401, 403, 429, 500, 502, 503, 504}
+GEMINI_NETWORK_COOLDOWN_SECONDS = 15.0
+GEMINI_DEFAULT_COOLDOWN_SECONDS = 60.0
+GEMINI_AUTH_COOLDOWN_SECONDS = 300.0
+GEMINI_MAX_COOLDOWN_SECONDS = 3600.0
+GEMINI_KEY_COOLDOWN_STATUS_CODES = {401, 403, 429}
 
 
-def _gemini_key_attempt_order() -> list[str]:
+def _gemini_retry_delay_seconds(response: requests.Response) -> float | None:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {}
+
+    details = payload.get("error", {}).get("details", []) if isinstance(payload, dict) else []
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        retry_delay = str(detail.get("retryDelay") or "").strip()
+        if retry_delay.endswith("s"):
+            try:
+                return float(retry_delay[:-1])
+            except ValueError:
+                pass
+
+    match = re.search(r"retry\s+in\s+([0-9.]+)\s*s", response.text, flags=re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _gemini_cooldown_seconds(response: requests.Response | None = None) -> float:
+    if response is None:
+        return GEMINI_NETWORK_COOLDOWN_SECONDS
+    if response.status_code in {401, 403}:
+        return GEMINI_AUTH_COOLDOWN_SECONDS
+    retry_delay = _gemini_retry_delay_seconds(response)
+    if retry_delay is not None:
+        return max(1.0, min(retry_delay, GEMINI_MAX_COOLDOWN_SECONDS))
+    if response.status_code == 429:
+        return GEMINI_DEFAULT_COOLDOWN_SECONDS
+    return GEMINI_NETWORK_COOLDOWN_SECONDS
+
+
+def _mark_gemini_key_cooling(api_key: str, response: requests.Response | None = None) -> None:
+    until = time.monotonic() + _gemini_cooldown_seconds(response)
+    GEMINI_KEY_COOLDOWNS[api_key] = max(GEMINI_KEY_COOLDOWNS.get(api_key, 0), until)
+
+
+def _should_cool_gemini_key(response: requests.Response) -> bool:
+    return response.status_code in GEMINI_KEY_COOLDOWN_STATUS_CODES
+
+
+def _clear_gemini_key_cooling(api_key: str) -> None:
+    GEMINI_KEY_COOLDOWNS.pop(api_key, None)
+
+
+def _gemini_cooldown_message() -> str:
+    now = time.monotonic()
+    waits = [
+        expires_at - now
+        for key, expires_at in GEMINI_KEY_COOLDOWNS.items()
+        if key in SETTINGS.gemini_api_keys and expires_at > now
+    ]
+    if not waits:
+        return ""
+    shortest_wait = max(1, int(min(waits) + 0.999))
+    return f"所有 Gemini key 刚刚触发限流或临时错误，正在冷却；最短约 {shortest_wait} 秒后重试。"
+
+
+def _gemini_key_attempt_order(limit: int | None = None) -> list[tuple[int, str]]:
     global GEMINI_KEY_CURSOR
 
     keys = SETTINGS.gemini_api_keys
@@ -699,12 +820,325 @@ def _gemini_key_attempt_order() -> list[str]:
         return []
     start = GEMINI_KEY_CURSOR % len(keys)
     GEMINI_KEY_CURSOR = (start + 1) % len(keys)
-    return [keys[(start + offset) % len(keys)] for offset in range(len(keys))]
+    now = time.monotonic()
+    attempts: list[tuple[int, str]] = []
+    for offset in range(len(keys)):
+        key_index = (start + offset) % len(keys)
+        api_key = keys[key_index]
+        if GEMINI_KEY_COOLDOWNS.get(api_key, 0) > now:
+            continue
+        attempts.append((key_index + 1, api_key))
+        if limit is not None and len(attempts) >= limit:
+            break
+    return attempts
 
 
 class ModelTesterService:
+    def _model_profiles(self) -> list[ModelProfile]:
+        return build_model_profiles(SETTINGS)
+
+    def _route_task_type(self, payload: dict[str, Any]) -> str:
+        return normalize_task_type(payload.get("taskType") or payload.get("mode"), payload)
+
+    def _route_purpose(self, task_type: str) -> str:
+        return "image-to-markdown" if task_type in {"ocr.image_to_markdown", "ocr.zh", "ocr.bo"} else "chat"
+
+    def _router_config(self) -> dict[str, Any]:
+        return {
+            "autoModel": True,
+            "defaultTaskType": "general.chat",
+            "taskTypes": list(SUPPORTED_TASK_TYPES),
+            "constraintKeys": [
+                "prefer",
+                "allowProviders",
+                "denyProviders",
+                "preferredProvider",
+                "requireProvider",
+                "requireLocal",
+                "requireVision",
+                "maxCostTier",
+                "preferredModels",
+                "denyModels",
+            ],
+        }
+
+    def _benchmark_tasks(self, payload: dict[str, Any]) -> list[str]:
+        raw_tasks = payload.get("tasks") or payload.get("taskTypes")
+        if raw_tasks is None:
+            raw_tasks = list(BENCHMARK_TASKS)
+        if isinstance(raw_tasks, str):
+            raw_tasks = [item.strip() for item in raw_tasks.split(",") if item.strip()]
+        if not isinstance(raw_tasks, list):
+            return []
+        tasks: list[str] = []
+        for item in raw_tasks:
+            task_type = normalize_task_type(item)
+            if task_type in BENCHMARK_TASKS and task_type not in tasks:
+                tasks.append(task_type)
+        return tasks
+
+    def _benchmark_models(
+        self,
+        payload: dict[str, Any],
+        profiles: list[ModelProfile],
+    ) -> list[tuple[str, str, str, ModelProfile | None]]:
+        explicit_models = payload.get("models") or payload.get("modelRefs")
+        if isinstance(explicit_models, str):
+            explicit_models = [item.strip() for item in explicit_models.split(",") if item.strip()]
+
+        default_providers = {"openai-compatible", "gemini", "yunwu-gpt55"}
+        raw_providers = payload.get("providers")
+        if isinstance(raw_providers, str):
+            raw_providers = [item.strip() for item in raw_providers.split(",") if item.strip()]
+        providers = {
+            _normalize_provider_preset(str(item))
+            for item in (raw_providers if isinstance(raw_providers, list) else default_providers)
+        }
+
+        candidates: list[tuple[str, str, str, ModelProfile | None]] = []
+        if isinstance(explicit_models, list) and explicit_models:
+            fallback_provider = _normalize_provider_preset(str(payload.get("providerPreset") or "openai-compatible"))
+            for raw_model in explicit_models:
+                provider, model = _parse_model_ref(str(raw_model).strip(), fallback_provider)
+                if not model:
+                    continue
+                model_ref = _qualified_model_id(provider, model)
+                profile = find_model_profile(profiles, model_ref)
+                item = (model_ref, provider, model, profile)
+                if not any(existing[0] == model_ref for existing in candidates):
+                    candidates.append(item)
+        else:
+            for profile in profiles:
+                if profile.provider in providers and profile.available:
+                    candidates.append((profile.id, profile.provider, profile.model, profile))
+
+        return candidates[:MAX_BENCHMARK_MODELS]
+
+    def benchmark(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        tasks = self._benchmark_tasks(payload)
+        if not tasks:
+            return {
+                "ok": False,
+                "error": "请提供至少一个支持的 benchmark task。",
+                "supportedTasks": public_task_catalog(),
+            }
+
+        profiles = self._model_profiles()
+        selected_models = self._benchmark_models(payload, profiles)
+        if not selected_models:
+            return {
+                "ok": False,
+                "error": "没有找到可用于 benchmark 的已配置模型。",
+                "defaultProviders": ["local", "gemini", "yunwu"],
+            }
+
+        try:
+            requested_runs = int(payload.get("runs") or 1)
+        except (TypeError, ValueError):
+            requested_runs = 1
+        try:
+            requested_max_cases = int(payload.get("maxCases") or MAX_BENCHMARK_CASES)
+        except (TypeError, ValueError):
+            requested_max_cases = MAX_BENCHMARK_CASES
+        runs = max(1, min(requested_runs, MAX_BENCHMARK_RUNS))
+        max_cases = max(1, min(requested_max_cases, MAX_BENCHMARK_CASES))
+        grouped_cases = normalize_benchmark_cases(
+            payload.get("cases"),
+            tasks,
+            lambda value: normalize_task_type(value),
+        )
+        global_attachment_ids = payload.get("attachmentIds")
+        include_answers = payload.get("includeAnswers", True) not in {False, 0, "0", "false", "False"}
+        temperature = payload.get("temperature", 0)
+        max_tokens = payload.get("maxTokens")
+        result_profiles: list[dict[str, Any]] = []
+
+        for model_ref, provider, model, profile in selected_models:
+            task_results: list[dict[str, Any]] = []
+            for task_type in tasks:
+                cases = grouped_cases.get(task_type, [])[:max_cases]
+                rows: list[dict[str, Any]] = []
+                for run_index in range(runs):
+                    for case in cases:
+                        case_id = str(case.get("id") or "")
+                        row: dict[str, Any] = {
+                            "caseId": case_id if runs == 1 else f"{case_id}#run-{run_index + 1}",
+                            "taskType": task_type,
+                            "status": "pending",
+                        }
+                        if profile and not profile.available:
+                            row.update({"status": "skipped", "error": "provider 未配置或当前不可用"})
+                            rows.append(row)
+                            continue
+                        if profile and (
+                            (BENCHMARK_TASKS[task_type]["operation"] == "chat" and not profile.chat_capable)
+                            or (BENCHMARK_TASKS[task_type]["operation"] == "image-to-markdown" and not profile.image_capable)
+                        ):
+                            row.update({"status": "skipped", "error": "模型能力与该 benchmark task 不匹配"})
+                            rows.append(row)
+                            continue
+
+                        if BENCHMARK_TASKS[task_type]["inputType"] == "text":
+                            if not case_source_text(case):
+                                row.update({"status": "failed", "error": "缺少 sourceText/input 文本"})
+                                rows.append(row)
+                                continue
+                            request_payload = build_chat_payload(model_ref, task_type, case, temperature, max_tokens)
+                            invoke = self.chat
+                        else:
+                            attachment_ids = case_attachment_ids(case, global_attachment_ids)
+                            if not attachment_ids:
+                                row.update({"status": "failed", "error": "缺少 attachmentIds 图片附件"})
+                                rows.append(row)
+                                continue
+                            request_payload = build_image_payload(
+                                model_ref,
+                                task_type,
+                                case,
+                                temperature,
+                                max_tokens,
+                                global_attachment_ids,
+                            )
+                            invoke = self.image_to_markdown
+
+                        case_started_at = time.perf_counter()
+                        try:
+                            response = invoke(request_payload)
+                        except Exception as error:  # noqa: BLE001
+                            response = {"ok": False, "error": str(error)}
+                        elapsed_ms = round((time.perf_counter() - case_started_at) * 1000)
+                        answer = str(response.get("answer") or response.get("markdown") or response.get("content") or "").strip()
+                        ok = bool(response.get("ok")) and bool(answer)
+                        row.update(
+                            {
+                                "status": "completed" if ok else "failed",
+                                "latencyMs": response.get("latencyMs") if isinstance(response.get("latencyMs"), (int, float)) else elapsed_ms,
+                                "provider": str(response.get("provider") or provider),
+                                "model": str(response.get("model") or model),
+                                "modelRef": str(response.get("modelRef") or model_ref),
+                                "usage": response.get("usage"),
+                            }
+                        )
+                        if not ok:
+                            row["error"] = str(response.get("error") or "模型返回为空")
+                        else:
+                            score = score_against_reference(answer, case_reference(case))
+                            row["score"] = score.get("score") if score else None
+                            if score:
+                                row["scoreDetails"] = score
+                            if include_answers:
+                                row["answer"] = answer[:1600]
+                        rows.append(row)
+
+                summary = summarize_task_rows(task_type, rows)
+                summary["rows"] = rows
+                task_results.append(summary)
+
+            result_profiles.append(
+                {
+                    "modelRef": model_ref,
+                    "provider": provider,
+                    "model": model,
+                    "staticProfile": profile.public_dict() if profile else None,
+                    "tasks": task_results,
+                }
+            )
+
+        completed_count = sum(
+            task.get("completedCount", 0)
+            for model_profile in result_profiles
+            for task in model_profile.get("tasks", [])
+        )
+        return {
+            "ok": completed_count > 0,
+            "benchmarkRunId": uuid.uuid4().hex,
+            "tasks": tasks,
+            "models": [item[0] for item in selected_models],
+            "providers": sorted({item[1] for item in selected_models}),
+            "runs": runs,
+            "maxCasesPerTask": max_cases,
+            "includeAnswers": include_answers,
+            "scoreNotice": "score 是基于 reference 的字符 F1 + 序列相似度，不替代人工翻译/OCR 质量评审。",
+            "latencyMs": round((time.perf_counter() - started_at) * 1000),
+            "profiles": result_profiles,
+        }
+
+    def route(self, payload: dict[str, Any]) -> dict[str, Any]:
+        requested_model = str(payload.get("model") or "auto").strip() or "auto"
+        task_type = self._route_task_type(payload)
+        purpose = self._route_purpose(task_type)
+        profiles = self._model_profiles()
+
+        if not is_auto_model_ref(requested_model):
+            provider = _normalize_provider_preset(str(payload.get("providerPreset") or "openai-compatible"))
+            provider, model = _parse_model_ref(requested_model, provider)
+            if not model:
+                return {"ok": False, "error": "请先选择一个模型。", "requestedModel": requested_model, "taskType": task_type}
+            model_ref = _qualified_model_id(provider, model)
+            profile = find_model_profile(profiles, model_ref)
+            return {
+                "ok": True,
+                "purpose": purpose,
+                "taskType": task_type,
+                "requestedModel": requested_model,
+                "selectedModel": model_ref,
+                "resolvedModel": model_ref,
+                "provider": provider,
+                "model": model,
+                "fallbacks": [],
+                "reason": "已显式指定模型，未执行自动路由。",
+                "routerDecision": {
+                    "ok": True,
+                    "manual": True,
+                    "taskType": task_type,
+                    "selectedModel": model_ref,
+                    "provider": provider,
+                    "model": model,
+                    "reason": "已显式指定模型，未执行自动路由。",
+                    "constraints": {},
+                    "fallbacks": [],
+                    "candidates": [],
+                },
+                "modelProfile": profile.public_dict() if profile else None,
+            }
+
+        decision = select_model_for_payload(payload, profiles, purpose=purpose)
+        if not decision.ok or not decision.selected_model:
+            return {
+                "ok": False,
+                "error": decision.reason,
+                "purpose": purpose,
+                "taskType": task_type,
+                "requestedModel": requested_model,
+                "selectedModel": None,
+                "resolvedModel": None,
+                "provider": None,
+                "model": None,
+                "fallbacks": [],
+                "routerDecision": decision.public_dict(include_rejected=True),
+            }
+
+        profile = find_model_profile(profiles, decision.selected_model)
+        public_decision = decision.public_dict(include_rejected=True)
+        return {
+            "ok": True,
+            "purpose": purpose,
+            "taskType": task_type,
+            "requestedModel": requested_model,
+            "selectedModel": decision.selected_model,
+            "resolvedModel": decision.selected_model,
+            "provider": decision.provider,
+            "model": decision.model,
+            "fallbacks": public_decision.get("fallbacks") or [],
+            "reason": decision.reason,
+            "routerDecision": public_decision,
+            "modelProfile": profile.public_dict() if profile else None,
+        }
+
     def config(self) -> dict[str, Any]:
         unified_models = self._fallback_unified_models()
+        profiles = self._model_profiles()
         return {
             "ok": True,
             "baseUrl": SETTINGS.model_tester_base_url,
@@ -714,6 +1148,19 @@ class ModelTesterService:
             "defaultModels": SETTINGS.model_tester_models,
             "unifiedModels": unified_models,
             "defaultPreset": "openai-compatible",
+            "router": self._router_config(),
+            "modelProfiles": [profile.public_dict() for profile in profiles],
+            "taskGuides": {
+                "translation.zh_en": translation_zh_en_guide(),
+            },
+            "benchmark": {
+                "tasks": public_task_catalog(),
+                "defaultProviders": ["local", "gemini", "yunwu"],
+                "maxCasesPerTask": MAX_BENCHMARK_CASES,
+                "maxModels": MAX_BENCHMARK_MODELS,
+                "maxRuns": MAX_BENCHMARK_RUNS,
+                "scoreNotice": "score 是基于 reference 的字符 F1 + 序列相似度，不替代人工翻译/OCR 质量评审。",
+            },
             "presets": [
                 _provider_config("openai-compatible"),
                 _provider_config("gemini"),
@@ -733,16 +1180,24 @@ class ModelTesterService:
         return list(dict.fromkeys(items))
 
     def _model_item(self, provider: str, model: str, source: str = "configured") -> dict[str, Any]:
-        return {
-            "id": _qualified_model_id(provider, model),
-            "provider": provider,
-            "providerPrefix": _provider_prefix(provider),
-            "model": model,
-            "label": f"{_provider_prefix(provider)}:{model}",
-            "source": source,
-            "capability": _model_hint_type(model),
-            "imageCapable": _is_image_capable_model(model),
-        }
+        model_ref = _qualified_model_id(provider, model)
+        profile = find_model_profile(self._model_profiles(), model_ref)
+        if profile:
+            item = profile.public_dict()
+            item["source"] = source
+        else:
+            item = {
+                "id": model_ref,
+                "provider": provider,
+                "providerPrefix": _provider_prefix(provider),
+                "model": model,
+                "label": f"{_provider_prefix(provider)}:{model}",
+                "source": source,
+                "imageCapable": _is_image_capable_model(model),
+            }
+        item["capability"] = _model_hint_type(model)
+        item.setdefault("chatCapable", not any(token in model.lower() for token in ("embed", "embedding")))
+        return item
 
     def _list_all_models(self, payload: dict[str, Any]) -> dict[str, Any]:
         providers = ("openai-compatible", "gemini", "yunwu-gpt55", "mathpix")
@@ -820,21 +1275,32 @@ class ModelTesterService:
 
             errors: list[str] = []
             fallback_items = SETTINGS.gemini_models
-            for index, api_key in enumerate(_gemini_key_attempt_order(), start=1):
+            attempts = _gemini_key_attempt_order()
+            if not attempts:
+                return {
+                    "ok": False,
+                    "items": fallback_items,
+                    "source": "gemini-env",
+                    "error": _gemini_cooldown_message() or "Gemini key 池当前没有可用 key。",
+                }
+            for index, api_key in attempts:
                 url = f"{SETTINGS.gemini_base_url}/v1beta/models?key={quote(api_key)}"
                 try:
                     response = requests.get(url, timeout=SETTINGS.request_timeout_seconds)
                     if not response.ok:
                         errors.append(f"key#{index} -> {_compact_error(response)}")
-                        if response.status_code not in {401, 403, 429, 500, 502, 503, 504}:
+                        if response.status_code not in GEMINI_RETRYABLE_STATUS_CODES:
                             break
+                        _mark_gemini_key_cooling(api_key, response)
                         continue
                     models = _parse_gemini_models(response.json())
                     if models:
+                        _clear_gemini_key_cooling(api_key)
                         return {"ok": True, "items": models, "source": "gemini-api"}
                     errors.append(f"key#{index} -> 响应里没有可识别的 Gemini 文本/多模态模型")
                 except Exception as error:
                     errors.append(f"key#{index} -> {error}")
+                    _mark_gemini_key_cooling(api_key)
             return {"ok": False, "items": fallback_items, "source": "gemini-env", "error": "；".join(errors) or "Gemini 模型列表请求失败。"}
         if provider == "yunwu-gpt55":
             models = [SETTINGS.yunwu_gpt55_model] if SETTINGS.yunwu_gpt55_model else []
@@ -889,19 +1355,141 @@ class ModelTesterService:
             "error": "；".join(errors) or "模型列表请求失败",
         }
 
+    def _attach_chat_metadata(
+        self,
+        result: dict[str, Any],
+        provider: str,
+        model: str,
+        requested_model: str,
+        router_decision: RouteDecision | None = None,
+    ) -> dict[str, Any]:
+        response = dict(result)
+        if model:
+            model_ref = _qualified_model_id(provider, model)
+            response.setdefault("model", model)
+            response.setdefault("provider", provider)
+            response.setdefault("modelRef", model_ref)
+            response.setdefault("resolvedModel", model_ref)
+        if router_decision:
+            response["requestedModel"] = requested_model or "auto"
+            response["fallbackUsed"] = False
+            response["routerDecision"] = router_decision.public_dict(include_rejected=not router_decision.ok)
+        return response
+
+    def _route_chat_payload(self, payload: dict[str, Any]) -> tuple[dict[str, Any], RouteDecision]:
+        decision = select_model_for_payload(payload, self._model_profiles(), purpose="chat")
+        if not decision.ok or not decision.selected_model:
+            return payload, decision
+        routed_payload = dict(payload)
+        routed_payload["model"] = decision.selected_model
+        routed_payload["providerPreset"] = decision.provider or routed_payload.get("providerPreset") or "openai-compatible"
+        return routed_payload, decision
+
+    def _chat_with_ollama_native(
+        self,
+        payload: dict[str, Any],
+        model: str,
+        messages: list[Any],
+        base_url: str,
+        api_key: str,
+    ) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "temperature": float(payload.get("temperature", 0.7)),
+        }
+        max_tokens = payload.get("maxTokens")
+        if max_tokens not in (None, ""):
+            options["num_predict"] = int(max_tokens)
+        top_p = payload.get("topP")
+        if top_p not in (None, ""):
+            options["top_p"] = float(top_p)
+
+        request_body = {
+            "model": model,
+            "messages": _normalize_messages(messages),
+            "stream": False,
+            "think": bool(payload.get("enableThinking", False)),
+            "options": options,
+        }
+        path = "/api/chat"
+        started_at = time.perf_counter()
+        try:
+            response = requests.post(
+                _join_url(_ollama_native_base_url(base_url), path),
+                headers=_headers(api_key),
+                json=request_body,
+                timeout=SETTINGS.ocr_correction_timeout_seconds,
+            )
+            if not response.ok:
+                return {"ok": False, "error": f"{path} -> {_compact_error(response)}"}
+
+            data = response.json()
+            message = data.get("message") if isinstance(data.get("message"), dict) else {}
+            content = str(message.get("content") or "").strip()
+            if not content:
+                return {
+                    "ok": False,
+                    "error": "Ollama 原生接口返回成功，但正文为空。",
+                    "path": path,
+                    "latencyMs": round((time.perf_counter() - started_at) * 1000),
+                }
+
+            prompt_tokens = data.get("prompt_eval_count")
+            completion_tokens = data.get("eval_count")
+            usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                usage["total_tokens"] = prompt_tokens + completion_tokens
+
+            return {
+                "ok": True,
+                "answer": content,
+                "reasoning": str(message.get("thinking") or "").strip(),
+                "model": model,
+                "path": path,
+                "latencyMs": round((time.perf_counter() - started_at) * 1000),
+                "usage": usage,
+                "finishReason": data.get("done_reason"),
+                "raw": data,
+            }
+        except Exception as error:
+            return {"ok": False, "error": f"{path} -> {error}"}
+
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        requested_model = str(payload.get("model") or "").strip()
+        router_decision: RouteDecision | None = None
+        if is_auto_model_ref(requested_model):
+            payload, router_decision = self._route_chat_payload(payload)
+            if not router_decision.ok or not router_decision.selected_model:
+                return self._attach_chat_metadata(
+                    {"ok": False, "error": router_decision.reason},
+                    "",
+                    "",
+                    requested_model,
+                    router_decision,
+                )
+
         provider = _normalize_provider_preset(str(payload.get("providerPreset") or "openai-compatible"))
         provider, model = _parse_model_ref(str(payload.get("model") or "").strip(), provider)
+        resolved_model = model
         messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
         if not model:
-            return {"ok": False, "error": "请先选择一个模型。"}
+            return self._attach_chat_metadata({"ok": False, "error": "请先选择一个模型。"}, provider, model, requested_model, router_decision)
         if not messages:
-            return {"ok": False, "error": "请先输入一条消息。"}
+            return self._attach_chat_metadata({"ok": False, "error": "请先输入一条消息。"}, provider, model, requested_model, router_decision)
 
         if provider == "gemini":
-            return self._chat_with_gemini(payload, model, messages)
+            return self._attach_chat_metadata(
+                self._chat_with_gemini(payload, model, messages),
+                provider,
+                model,
+                requested_model,
+                router_decision,
+            )
 
         base_url, api_key, model, chat_path = _resolve_openai_provider_config(payload, provider)
+        model = resolved_model or model
         base_url, _, chat_path = _extract_endpoint_config(
             base_url,
             str(payload.get("modelsPath") or SETTINGS.model_tester_models_path),
@@ -909,7 +1497,22 @@ class ModelTesterService:
         )
 
         if not base_url:
-            return {"ok": False, "error": "请先填写模型服务 Base URL，或设置后端环境变量。"}
+            return self._attach_chat_metadata(
+                {"ok": False, "error": "请先填写模型服务 Base URL，或设置后端环境变量。"},
+                provider,
+                model,
+                requested_model,
+                router_decision,
+            )
+
+        if _should_use_ollama_native_chat(provider, model):
+            return self._attach_chat_metadata(
+                self._chat_with_ollama_native(payload, model, messages, base_url, api_key),
+                provider,
+                model,
+                requested_model,
+                router_decision,
+            )
 
         request_body: dict[str, Any] = {
             "model": model,
@@ -942,21 +1545,33 @@ class ModelTesterService:
                 message = choice.get("message") or {}
                 content = str(message.get("content") or choice.get("text") or "").strip()
                 reasoning = str(message.get("reasoning_content") or "").strip()
-                return {
-                    "ok": True,
-                    "answer": content,
-                    "reasoning": reasoning,
-                    "model": model,
-                    "path": path,
-                    "latencyMs": round((time.perf_counter() - started_at) * 1000),
-                    "usage": data.get("usage"),
-                    "finishReason": choice.get("finish_reason"),
-                    "raw": data,
-                }
+                return self._attach_chat_metadata(
+                    {
+                        "ok": True,
+                        "answer": content,
+                        "reasoning": reasoning,
+                        "model": model,
+                        "path": path,
+                        "latencyMs": round((time.perf_counter() - started_at) * 1000),
+                        "usage": data.get("usage"),
+                        "finishReason": choice.get("finish_reason"),
+                        "raw": data,
+                    },
+                    provider,
+                    model,
+                    requested_model,
+                    router_decision,
+                )
             except Exception as error:
                 errors.append(f"{path} -> {error}")
 
-        return {"ok": False, "error": "；".join(errors) or "模型请求失败"}
+        return self._attach_chat_metadata(
+            {"ok": False, "error": "；".join(errors) or "模型请求失败"},
+            provider,
+            model,
+            requested_model,
+            router_decision,
+        )
 
     def image_to_markdown(self, payload: dict[str, Any]) -> dict[str, Any]:
         attachment_ids = payload.get("attachmentIds") if isinstance(payload.get("attachmentIds"), list) else []
@@ -1114,7 +1729,10 @@ class ModelTesterService:
         encoded_model = quote(model.removeprefix("models/"), safe="")
         errors: list[str] = []
         started_at = time.perf_counter()
-        for index, api_key in enumerate(_gemini_image_key_attempt_order(), start=1):
+        attempts = _gemini_image_key_attempt_order()
+        if not attempts:
+            raise RuntimeError(_gemini_cooldown_message() or "Gemini key 池当前没有可用 key。")
+        for index, api_key in attempts:
             url = f"{SETTINGS.gemini_base_url}/v1beta/models/{encoded_model}:generateContent?key={quote(api_key)}"
             try:
                 response = requests.post(
@@ -1125,11 +1743,14 @@ class ModelTesterService:
                 )
             except requests.RequestException as error:
                 errors.append(f"key#{index} -> {error}")
+                _mark_gemini_key_cooling(api_key)
                 continue
             if not response.ok:
                 errors.append(f"key#{index} -> {_compact_error(response)}")
-                if response.status_code not in {401, 403, 429, 500, 502, 503, 504}:
+                if response.status_code not in GEMINI_RETRYABLE_STATUS_CODES:
                     break
+                if _should_cool_gemini_key(response):
+                    _mark_gemini_key_cooling(api_key, response)
                 continue
             data = response.json()
             candidates = data.get("candidates") or []
@@ -1141,6 +1762,7 @@ class ModelTesterService:
                 if isinstance(part, dict) and str(part.get("text") or "").strip()
             )
             usage = data.get("usageMetadata") or {}
+            _clear_gemini_key_cooling(api_key)
             return {
                 "markdown": markdown,
                 "path": "/v1beta/models/{model}:generateContent",
@@ -1293,7 +1915,10 @@ class ModelTesterService:
         started_at = time.perf_counter()
         errors: list[str] = []
         encoded_model = quote(model.removeprefix("models/"), safe="")
-        for index, api_key in enumerate(_gemini_key_attempt_order(), start=1):
+        attempts = _gemini_key_attempt_order()
+        if not attempts:
+            return {"ok": False, "error": _gemini_cooldown_message() or "Gemini key 池当前没有可用 key。"}
+        for index, api_key in attempts:
             url = f"{SETTINGS.gemini_base_url}/v1beta/models/{encoded_model}:generateContent?key={quote(api_key)}"
             try:
                 response = requests.post(
@@ -1304,8 +1929,9 @@ class ModelTesterService:
                 )
                 if not response.ok:
                     errors.append(f"key#{index} -> {_compact_error(response)}")
-                    if response.status_code not in {401, 403, 429, 500, 502, 503, 504}:
+                    if response.status_code not in GEMINI_RETRYABLE_STATUS_CODES:
                         break
+                    _mark_gemini_key_cooling(api_key, response)
                     continue
 
                 data = response.json()
@@ -1323,6 +1949,7 @@ class ModelTesterService:
                     "completion_tokens": usage.get("candidatesTokenCount"),
                     "total_tokens": usage.get("totalTokenCount"),
                 }
+                _clear_gemini_key_cooling(api_key)
                 return {
                     "ok": True,
                     "answer": answer,
@@ -1336,6 +1963,7 @@ class ModelTesterService:
                 }
             except Exception as error:
                 errors.append(f"key#{index} -> {error}")
+                _mark_gemini_key_cooling(api_key)
 
         return {"ok": False, "error": "；".join(errors) or "Gemini 请求失败"}
 

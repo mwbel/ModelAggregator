@@ -44,7 +44,7 @@ function renderModels(items) {
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.value = model;
-    checkbox.checked = ["gemini:gemini-2.5-flash", "yunwu:gpt-5.5", "mathpix:mathpix-text"].includes(model);
+    checkbox.checked = ["gemini:gemini-3.8-flash", "yunwu:gpt-5.5", "mathpix:mathpix-text"].includes(model);
 
     const code = document.createElement("code");
     code.textContent = model;

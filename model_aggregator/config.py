@@ -65,6 +65,12 @@ class Settings:
     mathpix_timeout_seconds: float = float(os.getenv("MATHPIX_TIMEOUT_SECONDS", "60"))
 
     ocr_correction_timeout_seconds: float = float(os.getenv("OCR_CORRECTION_TIMEOUT_SECONDS", "90"))
+    image_markdown_gemini_timeout_seconds: float = float(
+        os.getenv("IMAGE_MARKDOWN_GEMINI_TIMEOUT_SECONDS", os.getenv("OCR_CORRECTION_TIMEOUT_SECONDS", "120"))
+    )
+    image_markdown_yunwu_timeout_seconds: float = float(
+        os.getenv("IMAGE_MARKDOWN_YUNWU_TIMEOUT_SECONDS", os.getenv("OCR_CORRECTION_TIMEOUT_SECONDS", "120"))
+    )
     ocr_correction_max_output_tokens: int = int(os.getenv("OCR_CORRECTION_MAX_OUTPUT_TOKENS", "8192"))
 
     def __post_init__(self) -> None:
@@ -88,8 +94,18 @@ class Settings:
             self.gemini_api_keys = _parse_model_list(os.getenv("GEMINI_API_KEYS", ""))
         if self.gemini_models is None:
             self.gemini_models = _parse_model_list(
-                os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.0-flash,gemini-flash-latest")
+                os.getenv(
+                    "GEMINI_MODELS",
+                    "gemini-3.8-flash,gemini-3.6-flash,gemini-3.1-flash-lite,gemini-2.0-flash,gemini-flash-latest",
+                )
             )
+        self.gemini_models = [
+            model for model in self.gemini_models
+            if model.strip().removeprefix("gemini:") != "gemini-2.5-flash"
+        ]
+        for model in ("gemini-3.6-flash", "gemini-3.8-flash"):
+            if model not in self.gemini_models:
+                self.gemini_models.append(model)
 
     def public_dict(self) -> dict[str, Any]:
         return {

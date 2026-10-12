@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>模型测试与路由实验台</title>
+  <link rel="stylesheet" href="./model-tester.css">
+</head>
+<body>
+  <div class="tester-shell">
+    <aside class="tester-sidebar">
+      <a class="back-link" href="./index.html" aria-label="返回智能体首页">←</a>
+      <div class="brand-block">
+        <p>Universe Model Agent</p>
+        <h1>模型测试与路由实验台</h1>
+      </div>
+
+      <section class="control-group">
+        <label>服务通道</label>
+        <div id="servicePresetBar" class="service-preset-bar"></div>
+        <p id="servicePresetHint" class="field-note">选择一个后端服务预设。</p>
+      </section>
+
+      <section class="control-group">
+        <label for="baseUrlInput">Base URL</label>
+        <input id="baseUrlInput" type="url" placeholder="https://api.example.com">
+      </section>
+
+      <section class="control-group">
+        <div class="label-row">
+          <label for="apiKeyInput">API Key（后端管理）</label>
+          <button id="toggleKeyButton" class="icon-button eye-toggle" type="button" title="显示 API Key" aria-label="显示 API Key">
+            <span class="eye-icon" aria-hidden="true"></span>
+          </button>
+        </div>
+        <input id="apiKeyInput" type="password" autocomplete="off" placeholder="由聚合服务后端环境变量管理" disabled>
+        <p id="keyStatus" class="field-note">未检测配置</p>
+      </section>
+
+      <section class="control-group">
+        <div class="label-row">
+          <label for="modelSelect">模型</label>
+          <button id="refreshModelsButton" class="icon-button" type="button" title="刷新模型列表" aria-label="刷新模型列表">↻</button>
+        </div>
+        <select id="modelSelect"></select>
+        <p id="modelStatus" class="field-note">正在加载模型</p>
+      </section>
+
+      <section class="control-group">
+        <label for="dispatchModeSelect">调用模式</label>
+        <select id="dispatchModeSelect">
+          <option value="manual">手动模型</option>
+          <option value="auto">智能路由</option>
+        </select>
+        <p id="dispatchModeHint" class="field-note">当前会直接使用所选模型。</p>
+      </section>
+
+      <section class="split-controls route-split">
+        <div class="control-group">
+          <label for="taskTypeSelect">任务类型</label>
+          <select id="taskTypeSelect"></select>
+        </div>
+        <div class="control-group">
+          <label for="routePreferSelect">路由偏好</label>
+          <select id="routePreferSelect">
+            <option value="quality">质量优先</option>
+            <option value="speed">速度优先</option>
+            <option value="cost">成本优先</option>
+            <option value="privacy">隐私优先</option>
+            <option value="balanced">平衡</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="split-controls route-split">
+        <div class="control-group">
+          <label for="preferredProviderSelect">Provider 偏好</label>
+          <select id="preferredProviderSelect"></select>
+        </div>
+        <div class="control-group">
+          <label for="maxCostTierSelect">最高成本</label>
+          <select id="maxCostTierSelect">
+            <option value="">不限</option>
+            <option value="low">low</option>
+            <option value="low-medium">low-medium</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="control-group">
+        <div class="route-flags">
+          <label class="route-flag"><input id="requireLocalCheckbox" type="checkbox">仅本地</label>
+          <label class="route-flag"><input id="requireVisionCheckbox" type="checkbox">要求视觉</label>
+        </div>
+        <button id="previewRouteButton" class="secondary-button" type="button">预览路由</button>
+      </section>
+
+      <section class="split-controls">
+        <div class="control-group">
+          <label for="temperatureInput">Temperature</label>
+          <input id="temperatureInput" type="number" min="0" max="2" step="0.1" value="0.7">
+        </div>
+        <div class="control-group">
+          <label for="maxTokensInput">Max tokens</label>
+          <input id="maxTokensInput" type="number" min="1" step="1" placeholder="auto">
+        </div>
+      </section>
+
+      <section class="control-group">
+        <label for="modelsPathInput">Models path</label>
+        <input id="modelsPathInput" type="text" value="/models">
+      </section>
+
+      <section class="control-group">
+        <label for="chatPathInput">Chat path</label>
+        <input id="chatPathInput" type="text" value="/chat/completions">
+      </section>
+
+      <button id="clearButton" class="secondary-button" type="button">清空对话</button>
+    </aside>
+
+    <main class="chat-panel">
+      <header class="chat-header">
+        <div>
+          <p id="activeServiceLabel">OpenAI-compatible</p>
+          <h2 id="activeModelTitle">选择模型后开始测试</h2>
+        </div>
+        <span id="requestBadge" class="request-badge">Ready</span>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite"></section>
+
+      <div class="chat-bottom">
+        <form id="chatForm" class="composer">
+          <div class="composer-stack">
+            <div id="attachmentList" class="attachment-list"></div>
+            <div class="composer-row">
+              <input id="attachmentInput" class="hidden-file-input" type="file" multiple>
+              <button id="attachButton" class="attach-button" type="button" title="添加附件" aria-label="添加附件">＋</button>
+              <textarea id="messageInput" rows="1" placeholder="输入测试问题，Enter 发送，Shift + Enter 换行"></textarea>
+            </div>
+          </div>
+          <div class="composer-actions">
+            <button id="compareButton" class="secondary-button compare-button" type="button">对比</button>
+            <button id="sendButton" class="send-button" type="submit">发送</button>
+          </div>
+        </form>
+
+        <section class="model-picker-panel" aria-label="可用模型">
+          <div class="model-picker-head">
+            <div>
+              <strong>可用模型</strong>
+              <p id="modelChecklistHint" class="field-note">默认可多选，用于横向对比。</p>
+            </div>
+            <div class="model-picker-actions">
+              <button id="selectOnlineModelsButton" class="text-button compact-button" type="button">在线识别</button>
+              <button id="selectAllModelsButton" class="text-button compact-button" type="button">全选</button>
+              <button id="deselectAllModelsButton" class="text-button compact-button" type="button">全不选</button>
+            </div>
+          </div>
+          <div id="modelChecklist" class="model-checklist"></div>
+        </section>
+      </div>
+    </main>
+
+    <aside class="inspector">
+      <section>
+        <h2>运行状态</h2>
+        <dl class="metric-list">
+          <div>
+            <dt>延迟</dt>
+            <dd id="latencyValue">-</dd>
+          </div>
+          <div>
+            <dt>Tokens</dt>
+            <dd id="tokensValue">-</dd>
+          </div>
+          <div>
+            <dt>Finish</dt>
+            <dd id="finishValue">-</dd>
+          </div>
+          <div>
+            <dt>Path</dt>
+            <dd id="pathValue">-</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section>
+        <div class="inspector-head">
+          <h2>角色提示词</h2>
+          <span id="promptPresetStatus" class="mini-note">严谨助手</span>
+        </div>
+        <div id="promptPresetBar" class="prompt-preset-bar"></div>
+      </section>
+
+      <section>
+        <div class="settings-summary">
+          <h2>本轮设置</h2>
+          <p id="requestSettingsSummary">Temperature 0.7 · System prompt 已启用</p>
+        </div>
+      </section>
+
+      <section>
+        <div class="inspector-head">
+          <h2>路由决策</h2>
+          <span id="routeStatus" class="mini-note">未预览</span>
+        </div>
+        <div class="route-summary-card">
+          <div class="route-summary-row">
+            <span>任务</span>
+            <strong id="routeTaskTypeValue">-</strong>
+          </div>
+          <div class="route-summary-row">
+            <span>命中模型</span>
+            <strong id="routeSelectedModelValue">-</strong>
+          </div>
+          <div class="route-summary-row">
+            <span>Provider</span>
+            <strong id="routeProviderValue">-</strong>
+          </div>
+          <div class="route-summary-row">
+            <span>Fallbacks</span>
+            <strong id="routeFallbacksValue">-</strong>
+          </div>
+          <div class="route-summary-row is-block">
+            <span>模型画像</span>
+            <p id="routeProfileValue">-</p>
+          </div>
+          <div class="route-summary-row is-block">
+            <span>原因</span>
+            <p id="routeReasonValue">-</p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="inspector-head">
+          <h2>系统提示词</h2>
+          <button id="resetSystemButton" class="text-button" type="button">重置</button>
+        </div>
+        <textarea id="systemPromptInput" rows="7">你是一个严谨、直接的中文助手。回答时优先给出结论，再补充必要解释。</textarea>
+      </section>
+
+      <section>
+        <div class="inspector-head">
+          <h2>原始响应</h2>
+          <button id="copyRawButton" class="text-button" type="button">复制</button>
+        </div>
+        <pre id="rawResponse" class="raw-response">{}</pre>
+      </section>
+    </aside>
+  </div>
+
+  <script src="./model-tester.js"></script>
+</body>
+</html>
